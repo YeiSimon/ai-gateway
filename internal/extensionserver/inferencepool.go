@@ -99,7 +99,10 @@ func getInferencePoolByMetadata(meta *corev3.Metadata) *gwaiev1.InferencePool {
 	}
 
 	result := strings.Split(metadata, "/")
-	if len(result) != 6 {
+	// The 7th field, failureMode, was added after the 6-field format. Metadata written by an
+	// older extension server during a rolling upgrade has only 6 fields; it is read as FailClose,
+	// which is what that version enforced.
+	if len(result) != 6 && len(result) != 7 {
 		return nil
 	}
 	ns := result[0]
@@ -111,6 +114,10 @@ func getInferencePoolByMetadata(meta *corev3.Metadata) *gwaiev1.InferencePool {
 	}
 	processingBodyMode := result[4]
 	allowModeOverride := result[5]
+	failureMode := gwaiev1.EndpointPickerFailClose
+	if len(result) == 7 && gwaiev1.EndpointPickerFailureMode(result[6]) == gwaiev1.EndpointPickerFailOpen {
+		failureMode = gwaiev1.EndpointPickerFailOpen
+	}
 	return &gwaiev1.InferencePool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -122,15 +129,22 @@ func getInferencePoolByMetadata(meta *corev3.Metadata) *gwaiev1.InferencePool {
 		},
 		Spec: gwaiev1.InferencePoolSpec{
 			EndpointPickerRef: &gwaiev1.EndpointPickerRef{
-				Name: gwaiev1.ObjectName(serviceName),
-				Port: ptr.To(gwaiev1.Port{Number: gwaiev1.PortNumber(port)}),
+				Name:        gwaiev1.ObjectName(serviceName),
+				Port:        ptr.To(gwaiev1.Port{Number: gwaiev1.PortNumber(port)}),
+				FailureMode: failureMode,
 			},
 		},
 	}
 }
 
+// inferencePoolFailsOpen reports whether requests to the pool should continue when its endpoint
+// picker is unavailable. An unset failureMode means FailClose, the API default.
+func inferencePoolFailsOpen(pool *gwaiev1.InferencePool) bool {
+	return pool.Spec.EndpointPickerRef != nil && pool.Spec.EndpointPickerRef.FailureMode == gwaiev1.EndpointPickerFailOpen
+}
+
 // buildMetadataForInferencePool adds InferencePool metadata to the cluster for reference by other components.
-// encoded as a string in the format: "namespace/name/serviceName/port/bodyMode/allowModeOverride".
+// encoded as a string in the format: "namespace/name/serviceName/port/bodyMode/allowModeOverride/failureMode".
 func buildEPPMetadataForCluster(cluster *clusterv3.Cluster, inferencePool *gwaiev1.InferencePool) {
 	// Initialize cluster metadata structure if not present.
 	if cluster.Metadata == nil {
@@ -179,6 +193,7 @@ func buildEPPMetadata(metadata *corev3.Metadata, inferencePool *gwaiev1.Inferenc
 			portForInferencePool(inferencePool),
 			processingBodyMode,
 			allowModeOverride,
+			inferencePoolFailsOpen(inferencePool),
 		),
 	)
 }
@@ -325,7 +340,7 @@ func buildHTTPFilterForInferencePool(pool *gwaiev1.InferencePool) *extprocv3.Ext
 	// Read allow mode override from annotations, default to false
 	allowModeOverride := getAllowModeOverrideFromAnnotations(pool)
 
-	return &extprocv3.ExternalProcessor{
+	filter := &extprocv3.ExternalProcessor{
 		GrpcService: &corev3.GrpcService{
 			TargetSpecifier: &corev3.GrpcService_EnvoyGrpc_{
 				EnvoyGrpc: &corev3.GrpcService_EnvoyGrpc{
@@ -344,8 +359,23 @@ func buildHTTPFilterForInferencePool(pool *gwaiev1.InferencePool) *extprocv3.Ext
 		},
 		AllowModeOverride: allowModeOverride,
 		MessageTimeout:    durationpb.New(300 * time.Second),
-		FailureModeAllow:  false,
+		// With FailOpen, a request continues when the endpoint picker is unreachable. It then
+		// carries no endpoint selection, and the pool's cluster falls back to its own load
+		// balancing (see configureFallbackClusterForInferencePool). With FailClose it fails.
+		FailureModeAllow: inferencePoolFailsOpen(pool),
 	}
+	if inferencePoolFailsOpen(pool) {
+		// A FailOpen pool's cluster takes the picker's choice from dynamic metadata (see
+		// configureFallbackClusterForInferencePool). ext_proc drops dynamic metadata returned by
+		// the processor unless its namespace is listed here, and without it every request would
+		// silently use the fallback instead of the picker's choice.
+		filter.MetadataOptions = &extprocv3.MetadataOptions{
+			ReceivingNamespaces: &extprocv3.MetadataOptions_MetadataNamespaces{
+				Untyped: []string{internalapi.EndpointPickerMetadataNamespace},
+			},
+		}
+	}
+	return filter
 }
 
 // getProcessingBodyModeFromAnnotations reads the processing body mode from InferencePool annotations.
