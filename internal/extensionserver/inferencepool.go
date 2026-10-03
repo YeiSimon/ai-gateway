@@ -21,10 +21,12 @@ import (
 	httpconnectionmanagerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	upstreamsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
+	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -263,6 +265,10 @@ func buildExtProcClusterForInferencePoolEndpointPicker(pool *gwaiev1.InferencePo
 				}},
 			}},
 		},
+	}
+
+	if inferencePoolFailsOpen(pool) {
+		configureEndpointPickerHealthCheck(c)
 	}
 
 	http2Opts := &upstreamsv3.HttpProtocolOptions{
@@ -514,4 +520,37 @@ func searchInferencePoolInFilterChain(pool *gwaiev1.InferencePool, chain []*http
 		}
 	}
 	return nil, -1, nil
+}
+
+// configureEndpointPickerHealthCheck makes an unreachable endpoint picker fail ext_proc stream
+// creation synchronously, so that failure_mode_allow takes effect for a FailOpen pool.
+//
+// ext_proc in FULL_DUPLEX_STREAMED mode cannot fail open once it has received the request body,
+// and a connection failure to the picker is only reported after that, so the request fails even
+// with failure_mode_allow. With an active health check and panic mode disabled, a dead picker
+// leaves the cluster with no healthy host, so the stream fails in decodeHeaders, before any body
+// is received, and the request continues. A TCP check on the picker's own port needs no extra
+// API for a health port; the cluster's TLS socket means the check also covers the handshake.
+//
+// no_traffic_interval defaults to 60s and applies to a cluster that has not made a connection yet,
+// such as the picker's cluster in a freshly started Envoy that has served no request. Left at the
+// default, a picker that dies in that window is not noticed for up to a minute.
+//
+// A request that arrives within one health check interval after the picker dies, or before the
+// first check completes after the cluster is created, can still fail or skip the picker.
+func configureEndpointPickerHealthCheck(c *clusterv3.Cluster) {
+	c.HealthChecks = []*corev3.HealthCheck{{
+		Timeout:            durationpb.New(time.Second),
+		Interval:           durationpb.New(time.Second),
+		NoTrafficInterval:  durationpb.New(time.Second),
+		UnhealthyThreshold: wrapperspb.UInt32(1),
+		HealthyThreshold:   wrapperspb.UInt32(1),
+		HealthChecker: &corev3.HealthCheck_TcpHealthCheck_{
+			TcpHealthCheck: &corev3.HealthCheck_TcpHealthCheck{},
+		},
+	}}
+	// Panic mode would send requests to unhealthy hosts when none is healthy, defeating the check.
+	c.CommonLbConfig = &clusterv3.Cluster_CommonLbConfig{
+		HealthyPanicThreshold: &typev3.Percent{Value: 0},
+	}
 }

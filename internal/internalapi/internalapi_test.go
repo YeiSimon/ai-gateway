@@ -17,12 +17,20 @@ func TestInferencePoolFallbackServiceName(t *testing.T) {
 	assert.Equal(t, "vllm-pool-epp-fallback", InferencePoolFallbackServiceName("vllm-pool"))
 
 	// Names that don't fit an RFC 1035 label of at most 63 characters use a stable hash.
-	long := "a-very-long-inference-pool-name-that-leaves-no-room-for-the-suffix"
-	for _, name := range []string{long, "pool.with.dots", "1pool-starts-with-a-digit"} {
-		got := InferencePoolFallbackServiceName(name)
-		require.LessOrEqual(t, len(got), 63, name)
-		require.Regexp(t, `^epp-fallback-[0-9a-f]{16}$`, got, name)
-		require.Equal(t, got, InferencePoolFallbackServiceName(name), "must be deterministic")
+	for _, tc := range []struct {
+		name     string
+		poolName string
+	}{
+		{name: "too long", poolName: "a-very-long-inference-pool-name-that-leaves-no-room-for-the-suffix"},
+		{name: "contains dots", poolName: "pool.with.dots"},
+		{name: "starts with a digit", poolName: "1pool-starts-with-a-digit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := InferencePoolFallbackServiceName(tc.poolName)
+			require.LessOrEqual(t, len(got), 63)
+			require.Regexp(t, `^epp-fallback-[0-9a-f]{16}$`, got)
+			require.Equal(t, got, InferencePoolFallbackServiceName(tc.poolName), "must be deterministic")
+		})
 	}
 	require.NotEqual(t, InferencePoolFallbackServiceName("pool.a"), InferencePoolFallbackServiceName("pool.b"))
 }

@@ -133,25 +133,47 @@ func TestBuildAndParseMetadata_FailureMode(t *testing.T) {
 	}
 }
 
-// TestGetInferencePoolByMetadata_SixFieldFormat verifies that metadata written before failureMode
-// was added (6 fields) still parses, as FailClose. During a rolling upgrade, clusters and routes may
-// carry either format.
-func TestGetInferencePoolByMetadata_SixFieldFormat(t *testing.T) {
-	md := &corev3.Metadata{
-		FilterMetadata: map[string]*structpb.Struct{
-			internalapi.InternalEndpointMetadataNamespace: {
-				Fields: map[string]*structpb.Value{
-					internalMetadataInferencePoolKey: structpb.NewStringValue("ns/name/svc/9002/duplex/false"),
+// TestGetInferencePoolByMetadata_FieldCount verifies which metadata formats are accepted. Metadata
+// written before failureMode was added (6 fields) still parses, as FailClose, because during a rolling
+// upgrade clusters and routes may carry either format.
+func TestGetInferencePoolByMetadata_FieldCount(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		metadata string
+		wantNil  bool
+		want     gwaiev1.EndpointPickerFailureMode
+	}{
+		{name: "6 fields is FailClose", metadata: "ns/name/svc/9002/duplex/false", want: gwaiev1.EndpointPickerFailClose},
+		{name: "7 fields FailOpen", metadata: "ns/name/svc/9002/duplex/false/FailOpen", want: gwaiev1.EndpointPickerFailOpen},
+		{name: "7 fields FailClose", metadata: "ns/name/svc/9002/duplex/false/FailClose", want: gwaiev1.EndpointPickerFailClose},
+		// Anything that is not exactly FailOpen must not make a pool fail open.
+		{name: "7 fields unknown value is FailClose", metadata: "ns/name/svc/9002/duplex/false/Garbage", want: gwaiev1.EndpointPickerFailClose},
+		{name: "7 fields empty value is FailClose", metadata: "ns/name/svc/9002/duplex/false/", want: gwaiev1.EndpointPickerFailClose},
+		{name: "5 fields", metadata: "ns/name/svc/9002/duplex", wantNil: true},
+		{name: "8 fields", metadata: "ns/name/svc/9002/duplex/false/FailOpen/extra", wantNil: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			md := &corev3.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{
+					internalapi.InternalEndpointMetadataNamespace: {
+						Fields: map[string]*structpb.Value{
+							internalMetadataInferencePoolKey: structpb.NewStringValue(tc.metadata),
+						},
+					},
 				},
-			},
-		},
+			}
+			pool := getInferencePoolByMetadata(md)
+			if tc.wantNil {
+				require.Nil(t, pool)
+				return
+			}
+			require.NotNil(t, pool)
+			assert.Equal(t, "name", pool.Name)
+			assert.Equal(t, "ns", pool.Namespace)
+			assert.Equal(t, tc.want, pool.Spec.EndpointPickerRef.FailureMode)
+			assert.Equal(t, tc.want == gwaiev1.EndpointPickerFailOpen, inferencePoolFailsOpen(pool))
+		})
 	}
-	pool := getInferencePoolByMetadata(md)
-	require.NotNil(t, pool)
-	assert.Equal(t, "name", pool.Name)
-	assert.Equal(t, "ns", pool.Namespace)
-	assert.Equal(t, gwaiev1.EndpointPickerFailClose, pool.Spec.EndpointPickerRef.FailureMode)
-	assert.False(t, inferencePoolFailsOpen(pool))
 }
 
 // TestGetInferencePoolByMetadata_Malformed tests parsing of invalid metadata strings.

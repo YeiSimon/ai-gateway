@@ -18,10 +18,14 @@ import (
 	override_hostv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/load_balancing_policies/override_host/v3"
 	metadatav3 "github.com/envoyproxy/go-control-plane/envoy/type/metadata/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 	gwaiev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 )
+
+// fallbackDNSRefreshRate is how often a FailOpen pool's cluster re-resolves its fallback Service.
+const fallbackDNSRefreshRate = time.Second
 
 // clusterRefInferencePool generates a unique reference for an InferencePool cluster.
 //
@@ -168,6 +172,16 @@ func configureFallbackClusterForInferencePool(cluster *clusterv3.Cluster, pool *
 	cluster.LbConfig = nil
 	cluster.LoadBalancingPolicy = policy
 	cluster.EdsClusterConfig = nil
+	cluster.OutlierDetection = fallbackOutlierDetection()
+	// Re-resolve the fallback Service every second. Envoy's default is 5 seconds, which is how long a
+	// Pod that left the Service keeps getting requests, and how long the pool has no endpoints if
+	// Envoy resolves the name before the controller has created the Service (when a pool is switched
+	// to FailOpen the cluster and the Service are created concurrently).
+	cluster.DnsRefreshRate = durationpb.New(fallbackDNSRefreshRate)
+	cluster.DnsFailureRefreshRate = &clusterv3.Cluster_RefreshRate{
+		BaseInterval: durationpb.New(fallbackDNSRefreshRate),
+		MaxInterval:  durationpb.New(fallbackDNSRefreshRate),
+	}
 
 	host := fmt.Sprintf("%s.%s.svc", internalapi.InferencePoolFallbackServiceName(pool.Name), pool.Namespace)
 	lbEndpoints := make([]*endpointv3.LbEndpoint, 0, len(pool.Spec.TargetPorts))
@@ -229,4 +243,29 @@ func overrideHostLoadBalancingPolicy() (*clusterv3.LoadBalancingPolicy, error) {
 			},
 		}},
 	}, nil
+}
+
+// fallbackOutlierDetection ejects a pool endpoint that keeps failing at the connection level, so that
+// requests stop going to a Pod that is Ready but broken until it recovers.
+//
+// The fallback cluster is resolved through DNS and has no active health check, so without this a
+// retry can leave a failed endpoint but the next request picks it again. Only local origin failures
+// (connect failures, resets and timeouts) count. Any HTTP status from the model server, including
+// 500 for a bad request and 503 when it is overloaded, must not eject a Pod that answers, so 5xx,
+// gateway failure and success rate ejection are disabled. At most half of the endpoints are ejected,
+// so a pool-wide failure never empties the cluster.
+//
+// An endpoint the endpoint picker chooses is not affected: override_host selects it even while it is
+// ejected, so this only keeps the fallback policy away from it.
+func fallbackOutlierDetection() *clusterv3.OutlierDetection {
+	return &clusterv3.OutlierDetection{
+		SplitExternalLocalOriginErrors:         true,
+		ConsecutiveLocalOriginFailure:          wrapperspb.UInt32(3),
+		EnforcingConsecutiveLocalOriginFailure: wrapperspb.UInt32(100),
+		EnforcingConsecutiveGatewayFailure:     wrapperspb.UInt32(0),
+		EnforcingConsecutive_5Xx:               wrapperspb.UInt32(0),
+		EnforcingSuccessRate:                   wrapperspb.UInt32(0),
+		BaseEjectionTime:                       durationpb.New(30 * time.Second),
+		MaxEjectionPercent:                     wrapperspb.UInt32(50),
+	}
 }

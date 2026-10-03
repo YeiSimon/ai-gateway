@@ -1808,6 +1808,24 @@ func TestPostClusterModify(t *testing.T) {
 		require.Equal(t, "envoy.load_balancing_policies.least_request", fallback.Name)
 		require.NoError(t, fallback.TypedConfig.UnmarshalTo(&least_requestv3.LeastRequest{}))
 
+		// A broken endpoint is ejected for connection level failures only; an application 500 or a slow
+		// response must not eject a healthy Pod, and the pool is never fully ejected.
+		od := cluster.OutlierDetection
+		require.NotNil(t, od)
+		require.True(t, od.SplitExternalLocalOriginErrors)
+		require.Equal(t, uint32(3), od.ConsecutiveLocalOriginFailure.Value)
+		require.Equal(t, uint32(100), od.EnforcingConsecutiveLocalOriginFailure.Value)
+		require.Zero(t, od.EnforcingConsecutiveGatewayFailure.Value)
+		require.Zero(t, od.EnforcingConsecutive_5Xx.Value)
+		require.Zero(t, od.EnforcingSuccessRate.Value)
+		require.Equal(t, uint32(50), od.MaxEjectionPercent.Value)
+
+		// The Service may be created after the cluster, and Pods leave it: both must be noticed
+		// well within Envoy's default of 5 seconds.
+		require.Equal(t, time.Second, cluster.DnsRefreshRate.AsDuration())
+		require.Equal(t, time.Second, cluster.DnsFailureRefreshRate.BaseInterval.AsDuration())
+		require.Equal(t, time.Second, cluster.DnsFailureRefreshRate.MaxInterval.AsDuration())
+
 		pool := getInferencePoolByMetadata(cluster.Metadata)
 		require.NotNil(t, pool)
 		require.Equal(t, gwaiev1.EndpointPickerFailOpen, pool.Spec.EndpointPickerRef.FailureMode)
@@ -2580,6 +2598,27 @@ func TestBuildExtProcClusterForInferencePoolEndpointPicker(t *testing.T) {
 		require.Equal(t, clusterv3.Cluster_LEAST_REQUEST, cluster.LbPolicy)
 		require.NotNil(t, cluster.LoadAssignment)
 		require.Len(t, cluster.LoadAssignment.Endpoints, 1)
+	})
+
+	t.Run("FailClose pool has no health check", func(t *testing.T) {
+		cluster, err := buildExtProcClusterForInferencePoolEndpointPicker(pool)
+		require.NoError(t, err)
+		require.Empty(t, cluster.HealthChecks)
+		require.Nil(t, cluster.CommonLbConfig)
+	})
+
+	t.Run("FailOpen pool fails fast when the picker is down", func(t *testing.T) {
+		failOpen := pool.DeepCopy()
+		failOpen.Spec.EndpointPickerRef.FailureMode = gwaiev1.EndpointPickerFailOpen
+		cluster, err := buildExtProcClusterForInferencePoolEndpointPicker(failOpen)
+		require.NoError(t, err)
+		require.Len(t, cluster.HealthChecks, 1)
+		require.NotNil(t, cluster.HealthChecks[0].GetTcpHealthCheck())
+		require.Equal(t, uint32(1), cluster.HealthChecks[0].UnhealthyThreshold.Value)
+		require.Equal(t, time.Second, cluster.HealthChecks[0].NoTrafficInterval.AsDuration())
+		// Panic mode must be off, or Envoy sends requests to the dead picker anyway.
+		require.NotNil(t, cluster.CommonLbConfig.HealthyPanicThreshold)
+		require.Zero(t, cluster.CommonLbConfig.HealthyPanicThreshold.Value)
 	})
 
 	t.Run("nil pool panics", func(t *testing.T) {
